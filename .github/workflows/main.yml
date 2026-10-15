@@ -1,6 +1,7 @@
 
-name: Project 1 - Create and Deploy Portfolio on AWS
+name: Project 1 - Automated AWS Portfolio Deployment
 
+# Run after changes are pushed to main/master, or manually.
 on:
   push:
     branches:
@@ -8,16 +9,18 @@ on:
       - master
   workflow_dispatch:
 
+# Only read access to repository source code is needed.
 permissions:
   contents: read
 
+# Avoid overlapping deployments to the same EC2 instance.
 concurrency:
   group: portfolio-project1-deployment
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Provision AWS and Deploy Portfolio
+    name: Create AWS Infrastructure and Deploy Website
     runs-on: ubuntu-latest
 
     env:
@@ -25,34 +28,34 @@ jobs:
       STACK_NAME: github-actions-portfolio-project1
 
     steps:
-      # 1. Check out the repository on the GitHub Actions runner
-      - name: Checkout portfolio repository
+      # --------------------------------------------------
+      # STEP 1: Get the latest code from this repository.
+      # --------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v7
 
-      # 2. Validate the main website files
-      - name: Validate website files
+      # --------------------------------------------------
+      # STEP 2: Check that the website files exist.
+      # --------------------------------------------------
+      - name: Validate portfolio files
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f index.html || {
-            echo "ERROR: index.html was not found."
-            exit 1
-          }
+          for file in index.html style.css script.js; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Required file '$file' was not found."
+              echo "Place the website files in the repository root."
+              exit 1
+            fi
+          done
 
-          test -f style.css || {
-            echo "ERROR: style.css was not found."
-            exit 1
-          }
+          echo "All required portfolio files were found."
 
-          test -f script.js || {
-            echo "ERROR: script.js was not found."
-            exit 1
-          }
-
-          echo "Website file validation passed."
-
-      # 3. Authenticate to AWS using repository secrets
+      # --------------------------------------------------
+      # STEP 3: Connect GitHub Actions to AWS.
+      # Uses your two GitHub repository secrets.
+      # --------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
@@ -60,16 +63,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 4. Verify which AWS identity is being used
+      # --------------------------------------------------
+      # STEP 4: Verify AWS authentication.
+      # --------------------------------------------------
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      # 5. Use the existing stack's Ubuntu AMI on subsequent runs.
-      #    On the first run, find the latest official Ubuntu 22.04 AMI.
-      - name: Select Ubuntu AMI
+      # --------------------------------------------------
+      # STEP 5: Select the official Ubuntu 22.04 AMI.
+      # Reuse the AMI parameter when the stack already exists.
+      # --------------------------------------------------
+      - name: Select Ubuntu image
         shell: bash
         run: |
           set -euo pipefail
+
+          AMI_ID=""
 
           AMI_ID=$(
             aws cloudformation describe-stacks \
@@ -96,22 +105,24 @@ jobs:
           fi
 
           echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
-          echo "Ubuntu AMI selected."
+          echo "Ubuntu image selected."
 
-      # 6. Generate the complete AWS infrastructure template.
-      #    The template is created by this workflow; no separate
-      #    CloudFormation file is required in your repository.
+      # --------------------------------------------------
+      # STEP 6: Generate the AWS infrastructure template.
+      # CloudFormation will create the resources described
+      # in this template.
+      # --------------------------------------------------
       - name: Generate infrastructure template
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/portfolio-stack.yaml" <<'CFN'
           AWSTemplateFormatVersion: '2010-09-09'
-          Description: New EC2 portfolio hosting infrastructure managed by GitHub Actions
+          Description: GitHub Actions managed Ubuntu portfolio server
 
           Parameters:
             AmiId:
               Type: AWS::EC2::Image::Id
-              Description: Official Ubuntu 22.04 AMI
+              Description: Official Ubuntu 22.04 image
 
           Resources:
             PortfolioVPC:
@@ -129,10 +140,10 @@ jobs:
               Properties:
                 Tags:
                   - Key: Name
-                    Value: gha-portfolio-igw
+                    Value: gha-portfolio-internet-gateway
 
             VPCGatewayAttachment:
-              Type: AWS::EC2::VPCGatewayAttachment
+              Type: AWS::EC2::VPC::VPCGatewayAttachment
               Properties:
                 VpcId: !Ref PortfolioVPC
                 InternetGatewayId: !Ref InternetGateway
@@ -176,7 +187,7 @@ jobs:
             WebSecurityGroup:
               Type: AWS::EC2::SecurityGroup
               Properties:
-                GroupDescription: Allow public HTTP access; no inbound SSH
+                GroupDescription: Public HTTP access without inbound SSH
                 VpcId: !Ref PortfolioVPC
                 SecurityGroupIngress:
                   - IpProtocol: tcp
@@ -233,32 +244,36 @@ jobs:
                     set -euxo pipefail
                     exec > /var/log/user-data.log 2>&1
 
+                    export DEBIAN_FRONTEND=noninteractive
                     apt-get update -y
-                    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx git curl
+                    apt-get install -y nginx git curl ca-certificates
 
-                    curl -fsSL \
-                      https://s3.ap-south-1.amazonaws.com/amazon-ssm-ap-south-1/latest/debian_amd64/amazon-ssm-agent.deb \
-                      -o /tmp/amazon-ssm-agent.deb
-
-                    dpkg -i /tmp/amazon-ssm-agent.deb
-                    systemctl enable --now amazon-ssm-agent
                     systemctl enable --now nginx
+
+                    # Ubuntu images normally include SSM Agent.
+                    # Start it if its systemd service is present.
+                    if systemctl list-unit-files | grep -q '^amazon-ssm-agent.service'; then
+                      systemctl enable --now amazon-ssm-agent
+                    fi
 
           Outputs:
             InstanceId:
-              Description: New portfolio EC2 instance ID
+              Description: New portfolio EC2 instance
               Value: !Ref PortfolioInstance
 
             PublicIP:
-              Description: Public IPv4 address of the portfolio server
+              Description: Public IPv4 address
               Value: !GetAtt PortfolioInstance.PublicIp
 
             WebsiteURL:
-              Description: HTTP address of the portfolio
+              Description: Public HTTP website address
               Value: !Sub "http://${PortfolioInstance.PublicIp}"
           CFN
 
-      # 7. Create the stack, or update it if it already exists
+      # --------------------------------------------------
+      # STEP 7: Create or update the AWS infrastructure.
+      # First run creates it; future runs reuse this stack.
+      # --------------------------------------------------
       - name: Create AWS infrastructure
         shell: bash
         run: |
@@ -272,7 +287,9 @@ jobs:
             --no-fail-on-empty-changeset \
             --tags Project=GitHubActionsPortfolio Environment=Learning
 
-      # 8. Read the instance ID and website address
+      # --------------------------------------------------
+      # STEP 8: Read the instance ID and public URL.
+      # --------------------------------------------------
       - name: Get deployment outputs
         shell: bash
         run: |
@@ -293,7 +310,7 @@ jobs:
           )
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "ERROR: Instance ID output not found."
+            echo "ERROR: The EC2 instance ID was not found."
             exit 1
           fi
 
@@ -304,8 +321,11 @@ jobs:
           echo "Website URL: $WEBSITE_URL"
           echo "Website URL: $WEBSITE_URL" >> "$GITHUB_STEP_SUMMARY"
 
-      # 9. Wait until the EC2 instance registers with Systems Manager
-      - name: Wait for EC2 Systems Manager
+      # --------------------------------------------------
+      # STEP 9: Wait until the instance is online in SSM.
+      # SSM lets us run commands without SSH or a PEM key.
+      # --------------------------------------------------
+      - name: Wait for Systems Manager
         shell: bash
         run: |
           set -euo pipefail
@@ -323,16 +343,20 @@ jobs:
               exit 0
             fi
 
-            echo "Waiting for EC2/SSM... attempt $attempt of 60"
+            echo "Waiting for EC2/SSM: attempt $attempt of 60"
             sleep 10
           done
 
-          echo "ERROR: EC2 did not register with Systems Manager."
+          echo "ERROR: EC2 did not become online in Systems Manager."
           echo "Check the CloudFormation stack and EC2 user-data logs."
           exit 1
 
-      # 10. Prepare the command that checks out and deploys the repository
-      - name: Prepare deployment script
+      # --------------------------------------------------
+      # STEP 10: Prepare the script that runs ON EC2.
+      # Important: Package installation happens in this
+      # script, not on the GitHub Actions runner.
+      # --------------------------------------------------
+      - name: Prepare EC2 deployment script
         shell: bash
         run: |
           set -euo pipefail
@@ -341,39 +365,66 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
+          # Wait for the initial Ubuntu setup to finish.
+          cloud-init status --wait || true
+
+          # Install Nginx and Git on the actual EC2 instance.
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y nginx git curl ca-certificates
+
+          systemctl enable --now nginx
+
+          # GitHub repository and branch are filled by the runner.
           REPO_URL="REPLACE_REPO_URL"
           BRANCH="REPLACE_BRANCH"
+
           SOURCE_DIR="/opt/portfolio-source"
           WEB_ROOT="/var/www/html"
 
+          # Clone the repository on the first run.
+          # On later runs, fetch the latest branch changes.
           if [ -d "$SOURCE_DIR/.git" ]; then
             git -C "$SOURCE_DIR" remote set-url origin "$REPO_URL"
-            git -C "$SOURCE_DIR" fetch --depth 1 origin \
-              "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-            git -C "$SOURCE_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
-            git -C "$SOURCE_DIR" reset --hard "origin/$BRANCH"
+            git -C "$SOURCE_DIR" fetch --depth 1 origin "$BRANCH"
+            git -C "$SOURCE_DIR" checkout -B "$BRANCH" FETCH_HEAD
+            git -C "$SOURCE_DIR" reset --hard FETCH_HEAD
           else
             rm -rf "$SOURCE_DIR"
             git clone --depth 1 --branch "$BRANCH" \
               "$REPO_URL" "$SOURCE_DIR"
           fi
 
+          # Validate the main site files before publishing.
+          for file in index.html style.css script.js; do
+            if [ ! -f "$SOURCE_DIR/$file" ]; then
+              echo "ERROR: Required file $file is missing from the repository."
+              exit 1
+            fi
+          done
+
+          # Copy the repository website files to Nginx's web root.
           mkdir -p "$WEB_ROOT"
           find "$WEB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-
           cp -a "$SOURCE_DIR/." "$WEB_ROOT/"
+
+          # Do not publish Git metadata or workflow files.
           rm -rf "$WEB_ROOT/.git" "$WEB_ROOT/.github"
 
           chown -R www-data:www-data "$WEB_ROOT"
 
+          # Validate and restart the web server.
           nginx -t
           systemctl enable --now nginx
           systemctl reload nginx
-          curl -fsS http://127.0.0.1/ >/dev/null
 
-          echo "Portfolio checkout, deployment and local HTTP test succeeded."
+          # Check the site locally on EC2.
+          curl -fsS http://127.0.0.1/ -o /dev/null
+
+          echo "SUCCESS: Repository checked out and website deployed."
           SCRIPT
 
+          # Insert the repository and branch into the remote script.
           sed -i \
             "s|REPLACE_REPO_URL|https://github.com/${GITHUB_REPOSITORY}.git|g" \
             "$RUNNER_TEMP/deploy-portfolio.sh"
@@ -382,7 +433,10 @@ jobs:
             "s|REPLACE_BRANCH|${GITHUB_REF_NAME}|g" \
             "$RUNNER_TEMP/deploy-portfolio.sh"
 
-      # 11. Run the deployment command on EC2 using SSM
+      # --------------------------------------------------
+      # STEP 11: Send the deployment script to EC2 using SSM.
+      # SSM runs the command on the remote Ubuntu instance.
+      # --------------------------------------------------
       - name: Deploy repository to Nginx
         shell: bash
         run: |
@@ -391,7 +445,8 @@ jobs:
           DEPLOY_B64=$(base64 -w 0 "$RUNNER_TEMP/deploy-portfolio.sh")
 
           PARAMETERS=$(
-            jq -cn --arg command "echo '$DEPLOY_B64' | base64 -d | bash" \
+            jq -cn \
+              --arg command "echo '$DEPLOY_B64' | base64 -d | bash" \
               '{commands: [$command]}'
           )
 
@@ -409,7 +464,7 @@ jobs:
 
           STATUS="Pending"
 
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 120); do
             STATUS=$(
               aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
@@ -429,26 +484,36 @@ jobs:
 
             case "$STATUS" in
               Failed|TimedOut|Cancelled|Undeliverable|Terminated)
+                echo "Remote deployment failed."
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --query "StandardErrorContent" \
                   --output text || true
-                echo "ERROR: Remote deployment failed."
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text || true
+
                 exit 1
                 ;;
             esac
 
-            echo "Deployment status: $STATUS"
+            echo "Remote deployment status: $STATUS"
             sleep 5
           done
 
           if [ "$STATUS" != "Success" ]; then
-            echo "ERROR: Timed out waiting for SSM deployment."
+            echo "ERROR: Timed out waiting for the remote deployment."
             exit 1
           fi
 
-      # 12. Verify the public website
+      # --------------------------------------------------
+      # STEP 12: Test the public website from GitHub Actions.
+      # --------------------------------------------------
       - name: Verify live website
         shell: bash
         run: |
@@ -456,13 +521,13 @@ jobs:
 
           for attempt in $(seq 1 12); do
             if curl -fsS "$WEBSITE_URL/" -o /dev/null; then
-              echo "SUCCESS: Website is responding at $WEBSITE_URL"
+              echo "SUCCESS: Website is live at $WEBSITE_URL"
               exit 0
             fi
 
-            echo "Waiting for website... attempt $attempt of 12"
+            echo "Waiting for the website: attempt $attempt of 12"
             sleep 5
           done
 
-          echo "ERROR: Website did not respond successfully."
+          echo "ERROR: The website did not respond over HTTP."
           exit 1
