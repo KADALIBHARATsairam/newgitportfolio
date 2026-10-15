@@ -1,5 +1,5 @@
 
-name: Project 1 - Automated AWS Portfolio Deployment
+name: Project 1 - Automated AWS Portfolio Deploymen
 
 # Run after changes are pushed to main/master, or manually.
 on:
