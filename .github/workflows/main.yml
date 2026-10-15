@@ -1,5 +1,5 @@
 
-name: Deploy Portfolio to AWS EC2
+name: Project 1 - Create and Deploy Portfolio on AWS
 
 on:
   push:
@@ -12,148 +12,457 @@ permissions:
   contents: read
 
 concurrency:
-  group: portfolio-ec2-deployment
+  group: portfolio-project1-deployment
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Validate and Deploy Website
+    name: Provision AWS and Deploy Portfolio
     runs-on: ubuntu-latest
 
     env:
       AWS_REGION: ap-south-1
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_SECURITY_GROUP_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
-      EC2_USER: ubuntu
+      STACK_NAME: github-actions-portfolio-project1
 
     steps:
-      # 1. Download repository files to the GitHub runner
-      - name: Checkout portfolio code
-        uses: actions/checkout@v6
+      # 1. Check out the repository on the GitHub Actions runner
+      - name: Checkout portfolio repository
+        uses: actions/checkout@v7
 
-      # 2. Confirm the main website files exist
-      - name: Validate portfolio files
+      # 2. Validate the main website files
+      - name: Validate website files
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           test -f index.html || {
-            echo "ERROR: index.html is missing"
+            echo "ERROR: index.html was not found."
             exit 1
           }
 
           test -f style.css || {
-            echo "ERROR: style.css is missing"
+            echo "ERROR: style.css was not found."
             exit 1
           }
 
           test -f script.js || {
-            echo "ERROR: script.js is missing"
+            echo "ERROR: script.js was not found."
             exit 1
           }
 
-          echo "Portfolio file validation successful."
+          echo "Website file validation passed."
 
-      # 3. Configure AWS credentials from GitHub Secrets
+      # 3. Authenticate to AWS using repository secrets
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESSKEY }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 4. Find the temporary GitHub runner public IP
-      - name: Get GitHub runner IP
+      # 4. Verify which AWS identity is being used
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # 5. Use the existing stack's Ubuntu AMI on subsequent runs.
+      #    On the first run, find the latest official Ubuntu 22.04 AMI.
+      - name: Select Ubuntu AMI
         shell: bash
         run: |
           set -euo pipefail
 
-          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com)
-          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          AMI_ID=$(
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Parameters[?ParameterKey=='AmiId'].ParameterValue | [0]" \
+              --output text 2>/dev/null || true
+          )
 
-          echo "GitHub runner IP identified."
+          if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "None" ]; then
+            AMI_ID=$(
+              aws ec2 describe-images \
+                --owners 099720109477 \
+                --filters \
+                  "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+                  "Name=state,Values=available" \
+                --query "Images | sort_by(@, &CreationDate)[-1].ImageId" \
+                --output text
+            )
+          fi
 
-      # 5. Permit SSH from this runner only
-      - name: Temporarily allow SSH
+          if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "None" ]; then
+            echo "ERROR: Could not find an Ubuntu AMI."
+            exit 1
+          fi
+
+          echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
+          echo "Ubuntu AMI selected."
+
+      # 6. Generate the complete AWS infrastructure template.
+      #    The template is created by this workflow; no separate
+      #    CloudFormation file is required in your repository.
+      - name: Generate infrastructure template
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/portfolio-stack.yaml" <<'CFN'
+          AWSTemplateFormatVersion: '2010-09-09'
+          Description: New EC2 portfolio hosting infrastructure managed by GitHub Actions
+
+          Parameters:
+            AmiId:
+              Type: AWS::EC2::Image::Id
+              Description: Official Ubuntu 22.04 AMI
+
+          Resources:
+            PortfolioVPC:
+              Type: AWS::EC2::VPC
+              Properties:
+                CidrBlock: 10.20.0.0/16
+                EnableDnsSupport: true
+                EnableDnsHostnames: true
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-vpc
+
+            InternetGateway:
+              Type: AWS::EC2::InternetGateway
+              Properties:
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-igw
+
+            VPCGatewayAttachment:
+              Type: AWS::EC2::VPCGatewayAttachment
+              Properties:
+                VpcId: !Ref PortfolioVPC
+                InternetGatewayId: !Ref InternetGateway
+
+            PublicSubnet:
+              Type: AWS::EC2::Subnet
+              Properties:
+                VpcId: !Ref PortfolioVPC
+                CidrBlock: 10.20.1.0/24
+                MapPublicIpOnLaunch: true
+                AvailabilityZone:
+                  Fn::Select:
+                    - 0
+                    - Fn::GetAZs: ""
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-public-subnet
+
+            PublicRouteTable:
+              Type: AWS::EC2::RouteTable
+              Properties:
+                VpcId: !Ref PortfolioVPC
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-route-table
+
+            PublicRoute:
+              Type: AWS::EC2::Route
+              DependsOn: VPCGatewayAttachment
+              Properties:
+                RouteTableId: !Ref PublicRouteTable
+                DestinationCidrBlock: 0.0.0.0/0
+                GatewayId: !Ref InternetGateway
+
+            SubnetRouteAssociation:
+              Type: AWS::EC2::SubnetRouteTableAssociation
+              Properties:
+                SubnetId: !Ref PublicSubnet
+                RouteTableId: !Ref PublicRouteTable
+
+            WebSecurityGroup:
+              Type: AWS::EC2::SecurityGroup
+              Properties:
+                GroupDescription: Allow public HTTP access; no inbound SSH
+                VpcId: !Ref PortfolioVPC
+                SecurityGroupIngress:
+                  - IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    CidrIp: 0.0.0.0/0
+                SecurityGroupEgress:
+                  - IpProtocol: "-1"
+                    CidrIp: 0.0.0.0/0
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-web-sg
+
+            EC2Role:
+              Type: AWS::IAM::Role
+              Properties:
+                AssumeRolePolicyDocument:
+                  Version: "2012-10-17"
+                  Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service: ec2.amazonaws.com
+                      Action: sts:AssumeRole
+                ManagedPolicyArns:
+                  - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+            EC2InstanceProfile:
+              Type: AWS::IAM::InstanceProfile
+              Properties:
+                Roles:
+                  - !Ref EC2Role
+
+            PortfolioInstance:
+              Type: AWS::EC2::Instance
+              DependsOn: SubnetRouteAssociation
+              Properties:
+                ImageId: !Ref AmiId
+                InstanceType: t3.micro
+                IamInstanceProfile: !Ref EC2InstanceProfile
+                NetworkInterfaces:
+                  - DeviceIndex: "0"
+                    AssociatePublicIpAddress: true
+                    SubnetId: !Ref PublicSubnet
+                    GroupSet:
+                      - !Ref WebSecurityGroup
+                Tags:
+                  - Key: Name
+                    Value: gha-portfolio-ec2
+                  - Key: Project
+                    Value: GitHubActionsPortfolio
+                UserData:
+                  Fn::Base64: |
+                    #!/bin/bash
+                    set -euxo pipefail
+                    exec > /var/log/user-data.log 2>&1
+
+                    apt-get update -y
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx git curl
+
+                    curl -fsSL \
+                      https://s3.ap-south-1.amazonaws.com/amazon-ssm-ap-south-1/latest/debian_amd64/amazon-ssm-agent.deb \
+                      -o /tmp/amazon-ssm-agent.deb
+
+                    dpkg -i /tmp/amazon-ssm-agent.deb
+                    systemctl enable --now amazon-ssm-agent
+                    systemctl enable --now nginx
+
+          Outputs:
+            InstanceId:
+              Description: New portfolio EC2 instance ID
+              Value: !Ref PortfolioInstance
+
+            PublicIP:
+              Description: Public IPv4 address of the portfolio server
+              Value: !GetAtt PortfolioInstance.PublicIp
+
+            WebsiteURL:
+              Description: HTTP address of the portfolio
+              Value: !Sub "http://${PortfolioInstance.PublicIp}"
+          CFN
+
+      # 7. Create the stack, or update it if it already exists
+      - name: Create AWS infrastructure
         shell: bash
         run: |
           set -euo pipefail
 
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$EC2_SECURITY_GROUP_ID" \
-            --protocol tcp \
-            --port 22 \
-            --cidr "${RUNNER_IP}/32"
+          aws cloudformation deploy \
+            --template-file "$RUNNER_TEMP/portfolio-stack.yaml" \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides "AmiId=$AMI_ID" \
+            --no-fail-on-empty-changeset \
+            --tags Project=GitHubActionsPortfolio Environment=Learning
 
-          echo "SSH_RULE_ADDED=true" >> "$GITHUB_ENV"
-          echo "Temporary SSH access enabled."
-
-      # 6. Prepare the private key securely on the runner
-      - name: Prepare SSH key
-        shell: bash
-        env:
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$HOME/.ssh"
-          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/ec2_key"
-          chmod 600 "$HOME/.ssh/ec2_key"
-
-      # 7. Transfer repository files to the Ubuntu instance
-      - name: Upload portfolio files
+      # 8. Read the instance ID and website address
+      - name: Get deployment outputs
         shell: bash
         run: |
           set -euo pipefail
 
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.terraform' \
-            --exclude='*.pem' \
-            --exclude='terraform.tfstate*' \
-            -czf - . |
-          ssh \
-            -i "$HOME/.ssh/ec2_key" \
-            -o StrictHostKeyChecking=accept-new \
-            "$EC2_USER@$EC2_HOST" \
-            'mkdir -p /tmp/portfolio-deploy &&
-             tar -xzf - -C /tmp/portfolio-deploy'
+          INSTANCE_ID=$(
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue | [0]" \
+              --output text
+          )
 
-          echo "Portfolio files transferred successfully."
+          WEBSITE_URL=$(
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='WebsiteURL'].OutputValue | [0]" \
+              --output text
+          )
 
-      # 8. Publish files to Nginx
-      - name: Deploy website to Nginx
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "ERROR: Instance ID output not found."
+            exit 1
+          fi
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "WEBSITE_URL=$WEBSITE_URL" >> "$GITHUB_ENV"
+
+          echo "EC2 instance: $INSTANCE_ID"
+          echo "Website URL: $WEBSITE_URL"
+          echo "Website URL: $WEBSITE_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      # 9. Wait until the EC2 instance registers with Systems Manager
+      - name: Wait for EC2 Systems Manager
         shell: bash
         run: |
           set -euo pipefail
 
-          ssh \
-            -i "$HOME/.ssh/ec2_key" \
-            -o StrictHostKeyChecking=accept-new \
-            "$EC2_USER@$EC2_HOST" \
-            'sudo mkdir -p /var/www/html &&
-             sudo find /var/www/html -mindepth 1 -maxdepth 1 -exec rm -rf {} + &&
-             sudo cp -a /tmp/portfolio-deploy/. /var/www/html/ &&
-             sudo rm -rf /var/www/html/.git &&
-             sudo chown -R www-data:www-data /var/www/html &&
-             sudo nginx -t &&
-             sudo systemctl enable --now nginx &&
-             sudo systemctl reload nginx &&
-             curl -fsS http://localhost/ >/dev/null &&
-             echo "Website deployed and local HTTP check passed."'
+          for attempt in $(seq 1 60); do
+            STATUS=$(
+              aws ssm describe-instance-information \
+                --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+                --query "InstanceInformationList[0].PingStatus" \
+                --output text 2>/dev/null || true
+            )
 
-      # 9. Remove the temporary SSH rule even if deployment fails
-      - name: Remove temporary SSH access
-        if: ${{ always() && env.SSH_RULE_ADDED == 'true' }}
+            if [ "$STATUS" = "Online" ]; then
+              echo "EC2 is online in Systems Manager."
+              exit 0
+            fi
+
+            echo "Waiting for EC2/SSM... attempt $attempt of 60"
+            sleep 10
+          done
+
+          echo "ERROR: EC2 did not register with Systems Manager."
+          echo "Check the CloudFormation stack and EC2 user-data logs."
+          exit 1
+
+      # 10. Prepare the command that checks out and deploys the repository
+      - name: Prepare deployment script
         shell: bash
         run: |
           set -euo pipefail
 
-          aws ec2 revoke-security-group-ingress \
-            --group-id "$EC2_SECURITY_GROUP_ID" \
-            --protocol tcp \
-            --port 22 \
-            --cidr "${RUNNER_IP}/32"
+          cat > "$RUNNER_TEMP/deploy-portfolio.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-          echo "Temporary SSH access removed."
+          REPO_URL="REPLACE_REPO_URL"
+          BRANCH="REPLACE_BRANCH"
+          SOURCE_DIR="/opt/portfolio-source"
+          WEB_ROOT="/var/www/html"
+
+          if [ -d "$SOURCE_DIR/.git" ]; then
+            git -C "$SOURCE_DIR" remote set-url origin "$REPO_URL"
+            git -C "$SOURCE_DIR" fetch --depth 1 origin \
+              "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git -C "$SOURCE_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+            git -C "$SOURCE_DIR" reset --hard "origin/$BRANCH"
+          else
+            rm -rf "$SOURCE_DIR"
+            git clone --depth 1 --branch "$BRANCH" \
+              "$REPO_URL" "$SOURCE_DIR"
+          fi
+
+          mkdir -p "$WEB_ROOT"
+          find "$WEB_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+          cp -a "$SOURCE_DIR/." "$WEB_ROOT/"
+          rm -rf "$WEB_ROOT/.git" "$WEB_ROOT/.github"
+
+          chown -R www-data:www-data "$WEB_ROOT"
+
+          nginx -t
+          systemctl enable --now nginx
+          systemctl reload nginx
+          curl -fsS http://127.0.0.1/ >/dev/null
+
+          echo "Portfolio checkout, deployment and local HTTP test succeeded."
+          SCRIPT
+
+          sed -i \
+            "s|REPLACE_REPO_URL|https://github.com/${GITHUB_REPOSITORY}.git|g" \
+            "$RUNNER_TEMP/deploy-portfolio.sh"
+
+          sed -i \
+            "s|REPLACE_BRANCH|${GITHUB_REF_NAME}|g" \
+            "$RUNNER_TEMP/deploy-portfolio.sh"
+
+      # 11. Run the deployment command on EC2 using SSM
+      - name: Deploy repository to Nginx
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOY_B64=$(base64 -w 0 "$RUNNER_TEMP/deploy-portfolio.sh")
+
+          PARAMETERS=$(
+            jq -cn --arg command "echo '$DEPLOY_B64' | base64 -d | bash" \
+              '{commands: [$command]}'
+          )
+
+          COMMAND_ID=$(
+            aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy portfolio from GitHub Actions" \
+              --parameters "$PARAMETERS" \
+              --query "Command.CommandId" \
+              --output text
+          )
+
+          echo "SSM command submitted: $COMMAND_ID"
+
+          STATUS="Pending"
+
+          for attempt in $(seq 1 60); do
+            STATUS=$(
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "Status" \
+                --output text 2>/dev/null || true
+            )
+
+            if [ "$STATUS" = "Success" ]; then
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+              break
+            fi
+
+            case "$STATUS" in
+              Failed|TimedOut|Cancelled|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "StandardErrorContent" \
+                  --output text || true
+                echo "ERROR: Remote deployment failed."
+                exit 1
+                ;;
+            esac
+
+            echo "Deployment status: $STATUS"
+            sleep 5
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "ERROR: Timed out waiting for SSM deployment."
+            exit 1
+          fi
+
+      # 12. Verify the public website
+      - name: Verify live website
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 12); do
+            if curl -fsS "$WEBSITE_URL/" -o /dev/null; then
+              echo "SUCCESS: Website is responding at $WEBSITE_URL"
+              exit 0
+            fi
+
+            echo "Waiting for website... attempt $attempt of 12"
+            sleep 5
+          done
+
+          echo "ERROR: Website did not respond successfully."
+          exit 1
