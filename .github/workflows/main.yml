@@ -1,0 +1,159 @@
+
+name: Deploy Portfolio to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portfolio-ec2-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Validate and Deploy Website
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ap-south-1
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_SECURITY_GROUP_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+      EC2_USER: ubuntu
+
+    steps:
+      # 1. Download repository files to the GitHub runner
+      - name: Checkout portfolio code
+        uses: actions/checkout@v6
+
+      # 2. Confirm the main website files exist
+      - name: Validate portfolio files
+        shell: bash
+        run: |
+          set -e
+
+          test -f index.html || {
+            echo "ERROR: index.html is missing"
+            exit 1
+          }
+
+          test -f style.css || {
+            echo "ERROR: style.css is missing"
+            exit 1
+          }
+
+          test -f script.js || {
+            echo "ERROR: script.js is missing"
+            exit 1
+          }
+
+          echo "Portfolio file validation successful."
+
+      # 3. Configure AWS credentials from GitHub Secrets
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESSKEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 4. Find the temporary GitHub runner public IP
+      - name: Get GitHub runner IP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
+          echo "GitHub runner IP identified."
+
+      # 5. Permit SSH from this runner only
+      - name: Temporarily allow SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$EC2_SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32"
+
+          echo "SSH_RULE_ADDED=true" >> "$GITHUB_ENV"
+          echo "Temporary SSH access enabled."
+
+      # 6. Prepare the private key securely on the runner
+      - name: Prepare SSH key
+        shell: bash
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/ec2_key"
+          chmod 600 "$HOME/.ssh/ec2_key"
+
+      # 7. Transfer repository files to the Ubuntu instance
+      - name: Upload portfolio files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.terraform' \
+            --exclude='*.pem' \
+            --exclude='terraform.tfstate*' \
+            -czf - . |
+          ssh \
+            -i "$HOME/.ssh/ec2_key" \
+            -o StrictHostKeyChecking=accept-new \
+            "$EC2_USER@$EC2_HOST" \
+            'mkdir -p /tmp/portfolio-deploy &&
+             tar -xzf - -C /tmp/portfolio-deploy'
+
+          echo "Portfolio files transferred successfully."
+
+      # 8. Publish files to Nginx
+      - name: Deploy website to Nginx
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i "$HOME/.ssh/ec2_key" \
+            -o StrictHostKeyChecking=accept-new \
+            "$EC2_USER@$EC2_HOST" \
+            'sudo mkdir -p /var/www/html &&
+             sudo find /var/www/html -mindepth 1 -maxdepth 1 -exec rm -rf {} + &&
+             sudo cp -a /tmp/portfolio-deploy/. /var/www/html/ &&
+             sudo rm -rf /var/www/html/.git &&
+             sudo chown -R www-data:www-data /var/www/html &&
+             sudo nginx -t &&
+             sudo systemctl enable --now nginx &&
+             sudo systemctl reload nginx &&
+             curl -fsS http://localhost/ >/dev/null &&
+             echo "Website deployed and local HTTP check passed."'
+
+      # 9. Remove the temporary SSH rule even if deployment fails
+      - name: Remove temporary SSH access
+        if: ${{ always() && env.SSH_RULE_ADDED == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$EC2_SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32"
+
+          echo "Temporary SSH access removed."
